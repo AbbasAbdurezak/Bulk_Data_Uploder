@@ -1,0 +1,6 @@
+@Bulk_Data_Uploder_HostAddress = http://localhost:5260
+
+GET {{Bulk_Data_Uploder_HostAddress}}/weatherforecast/
+Accept: application/json
+
+###
