@@ -2,45 +2,48 @@ using AspNetCoreRateLimit;
 using Bulk_Data_Uploder.Services;
 using Hangfire;
 using Hangfire.PostgreSql;
-using IpRateLimiter.AspNetCore.AltairCA.Models;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.IdentityModel.Tokens;
 using Microsoft.OpenApi.Models;
-using NPOI.SS.Formula.Functions;
 using Serilog;
 using Serilog.Events;
 using System.Text;
 
+
 var builder = WebApplication.CreateBuilder(args);
 
 // Configure Serilog
-Serilog.Log.Logger = new LoggerConfiguration()
+Log.Logger = new LoggerConfiguration()
     .MinimumLevel.Debug()
     .MinimumLevel.Override("Microsoft", LogEventLevel.Information)
     .Enrich.FromLogContext()
     .WriteTo.Console()
     .CreateLogger();
 
-// Configure Serilog from appsettings.json
 builder.Host.UseSerilog((context, config) =>
-{
-    config.ReadFrom.Configuration(context.Configuration);
-});
+    config.ReadFrom.Configuration(context.Configuration));
 
-// Add services to the container
-builder.Services.AddControllers();
+// ====== Critical Fixes Start ====== //
+// 1. Rate Limiting Configuration FIRST
+builder.Services.AddMemoryCache();
 
-// Configure MultiRegionDbContext with connection string
+// Client Rate Limiting Services
+builder.Services.Configure<ClientRateLimitOptions>(builder.Configuration.GetSection("ClientRateLimiting"));
+builder.Services.AddSingleton<IClientPolicyStore, MemoryCacheClientPolicyStore>();
+builder.Services.AddSingleton<IRateLimitCounterStore, MemoryCacheRateLimitCounterStore>();
+builder.Services.AddSingleton<IProcessingStrategy, AsyncKeyLockProcessingStrategy>();
+builder.Services.AddInMemoryRateLimiting(); // Changed in v5.x
+builder.Services.AddSingleton<IRateLimitConfiguration, RateLimitConfiguration>(); // Fixed syntax
+// ====== Critical Fixes End ====== //
+
+// Database Context (Single registration)
 builder.Services.AddDbContext<MultiRegionDbContext>(options =>
-    options.UseNpgsql(builder.Configuration.GetConnectionString("PrimaryDatabase")));
-
-
-// EF Core
-builder.Services.AddDbContext<MultiRegionDbContext>(options =>
-    options.UseNpgsql(builder.Configuration.GetConnectionString("PrimaryDatabase")));
+    options.UseNpgsql(builder.Configuration.GetConnectionString("Bulk_DB_Primary")));
 
 // JWT Authentication
+// JWT Authentication
+// ====== Auth Services ====== //
 builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
     .AddJwtBearer(options =>
     {
@@ -57,20 +60,21 @@ builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
         };
     });
 
+builder.Services.AddAuthorization(options =>
+{
+    options.AddPolicy("AdminOnly", policy =>
+        policy.RequireRole("Admin"));
+}); // <-- Add this line
+
+
+
+// Add controllers
+builder.Services.AddControllers(); // <-- Add this line
+
 // Hangfire
 builder.Services.AddHangfire(config =>
-    config.UsePostgreSqlStorage(builder.Configuration.GetConnectionString("PrimaryDatabase")));
+    config.UsePostgreSqlStorage(builder.Configuration.GetConnectionString("Bulk_DB_Primary")));
 builder.Services.AddHangfireServer();
-
-
-builder.Services.AddMemoryCache(); // Add this
-
-// Client Rate Limiting
-builder.Services.AddMemoryCache(); // Ensure this is called first
-builder.Services.Configure<ClientRateLimitOptions>(builder.Configuration.GetSection("ClientRateLimiting"));
-builder.Services.AddSingleton<IClientPolicyStore, MemoryCacheClientPolicyStore>();
-builder.Services.AddSingleton<IRateLimitCounterStore, MemoryCacheRateLimitCounterStore>();
-builder.Services.AddSingleton<IRateLimitConfiguration, RateLimitConfiguration>();
 
 // Swagger
 builder.Services.AddSwaggerGen(c =>
@@ -84,17 +88,16 @@ builder.Services.AddScoped<AIIntegrationService>();
 builder.Services.AddScoped<RateLimitService>();
 builder.Services.AddScoped<AIResponseVersionService>();
 
-//AI Integration
+// AI HttpClient
 builder.Services.AddHttpClient<AIIntegrationService>(client =>
 {
     client.BaseAddress = new Uri(builder.Configuration["DeepSeek:BaseUrl"]);
     client.DefaultRequestHeaders.Add("Accept", "application/json");
 });
 
-
 var app = builder.Build();
 
-// Configure the HTTP request pipeline
+// Middleware Pipeline
 if (app.Environment.IsDevelopment())
 {
     app.UseDeveloperExceptionPage();
@@ -104,9 +107,13 @@ if (app.Environment.IsDevelopment())
 
 app.UseHttpsRedirection();
 app.UseRouting();
+
+// Critical: Rate Limiting Middleware BEFORE Auth
+app.UseClientRateLimiting();
+
 app.UseAuthentication();
 app.UseAuthorization();
-app.UseClientRateLimiting();
+
 
 app.MapControllers();
 app.UseHangfireDashboard();
